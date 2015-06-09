@@ -139,6 +139,14 @@ typedef enum {
   NP_FORCE_ISO14443_B,
   /** Force the chip to run at 106 kbps */
   NP_FORCE_SPEED_106,
+  /** Set host to UART controller speed */
+  NP_UART_SPEED_HOST = 100,
+  /** Set UART controller to pn53x chip speed */
+  NP_UART_SPEED_TAMA = 101,
+  /** Switch red LED on/off */
+  NP_SWITCH_LED_RED = 102,
+  /** Switch green LED on/off */
+  NP_SWITCH_LED_GREEN = 103
 } nfc_property;
 
 // Compiler directive, set struct alignment to 1 uint8_t for compatibility

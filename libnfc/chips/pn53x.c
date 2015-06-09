@@ -472,13 +472,16 @@ pn53x_unwrap_frame(const uint8_t *pbtFrame, const size_t szFrameBits, uint8_t *p
 }
 
 int
-pn53x_decode_target_data(const uint8_t *pbtRawData, size_t szRawData, pn53x_type type, nfc_modulation_type nmt,
+pn53x_decode_target_data(const uint8_t *pbtRawData, size_t szRawData, pn53x_type type, pn53x_target_type ptt,
                          nfc_target_info *pnti)
 {
   uint8_t szAttribRes;
+  size_t skipLen, uidLen, atsLen, polResLen;
+
   const uint8_t *pbtUid;
 
-  switch (nmt) {
+  nfc_modulation nm = pn53x_ptt_to_nm(ptt);
+  switch (nm.nmt) {
     case NMT_ISO14443A:
       // We skip the first byte: its the target number (Tg)
       pbtRawData++;
@@ -613,7 +616,38 @@ pn53x_decode_target_data(const uint8_t *pbtRawData, size_t szRawData, pn53x_type
       break;
       // Should not happend...
     case NMT_DEP:
-      return NFC_ECHIP;
+      skipLen = 0;
+      switch (ptt) {
+        case PTT_DEP_PASSIVE_106:
+          /* ISO14443-4 DEP passive, we do not use ISO14443-4 data, just skip: */
+          uidLen = pbtRawData[4];
+          atsLen = pbtRawData[5+uidLen];
+          skipLen = uidLen + atsLen + 5;
+          break;
+        case PTT_DEP_PASSIVE_212:
+        case PTT_DEP_PASSIVE_424:
+          polResLen = pbtRawData[1];
+          skipLen = polResLen + 1;
+          break;
+        case PTT_DEP_ACTIVE_106:
+        case PTT_DEP_ACTIVE_212:
+        case PTT_DEP_ACTIVE_424:
+          /* Active targets does not have TargetData[] structure */
+          skipLen = 0;
+          break;
+      }
+      pbtRawData += skipLen;
+      memcpy(pnti->ndi.abtNFCID3, pbtRawData, 10);
+      pnti->ndi.btDID = pbtRawData[10];
+      pnti->ndi.btBS = pbtRawData[11];
+      pnti->ndi.btBR = pbtRawData[12];
+      pnti->ndi.btTO = pbtRawData[13];
+      pnti->ndi.btPP = pbtRawData[14];
+      pnti->ndi.szGB = szRawData - (skipLen + 15);
+      if (pnti->ndi.szGB > 0) {
+        memcpy(pnti->ndi.abtGB, pbtRawData + 15, pnti->ndi.szGB);
+      }
+      break;
   }
   return NFC_SUCCESS;
 }
@@ -1128,9 +1162,11 @@ pn53x_initiator_select_passive_target_ext(struct nfc_device *pnd,
         }
         szTargetsData = 6; // u16 UID_LSB, u8 prod code, u8 fab code, u16 UID_MSB
       }
-      nttmp.nm = nm;
-      if ((res = pn53x_decode_target_data(abtTargetsData, szTargetsData, CHIP_DATA(pnd)->type, nm.nmt, &(nttmp.nti))) < 0) {
-        return res;
+      if (pnt) {
+        pnt->nm = nm;
+        if ((res = pn53x_decode_target_data(abtTargetsData, szTargetsData, CHIP_DATA(pnd)->type, pn53x_nm_to_ptt(nm), &(pnt->nti))) < 0) {
+          return res;
+        }
       }
       if (nm.nmt == NMT_ISO14443BI) {
         // Select tag
@@ -2827,7 +2863,7 @@ pn53x_InAutoPoll(struct nfc_device *pnd,
       pntTargets[0].nm = pn53x_ptt_to_nm(ptt);
       // AutoPollTargetData length
       ln = *(pbt++);
-      if ((res = pn53x_decode_target_data(pbt, ln, CHIP_DATA(pnd)->type, pntTargets[0].nm.nmt, &(pntTargets[0].nti))) < 0) {
+      if ((res = pn53x_decode_target_data(pbt, ln, CHIP_DATA(pnd)->type, ptt, &(pntTargets[0].nti))) < 0) {
         return res;
       }
       pbt += ln;
@@ -2839,7 +2875,7 @@ pn53x_InAutoPoll(struct nfc_device *pnd,
         pntTargets[1].nm = pn53x_ptt_to_nm(ptt);
         // AutoPollTargetData length
         ln = *(pbt++);
-        pn53x_decode_target_data(pbt, ln, CHIP_DATA(pnd)->type, pntTargets[1].nm.nmt, &(pntTargets[1].nti));
+        pn53x_decode_target_data(pbt, ln, CHIP_DATA(pnd)->type, ptt, &(pntTargets[1].nti));
       }
     }
   }
@@ -3248,8 +3284,20 @@ pn53x_nm_to_ptt(const nfc_modulation nm)
     case NMT_ISO14443BI:
     case NMT_ISO14443B2SR:
     case NMT_ISO14443B2CT:
-    case NMT_DEP:
       // Nothing to do...
+      break;
+    case NMT_DEP:
+      switch (nm.nbr) {
+        case NBR_106:
+          return PTT_DEP_ACTIVE_106;
+          break;
+        case NBR_212:
+            return PTT_DEP_ACTIVE_212;
+            break;
+        case NBR_424:
+            return PTT_DEP_ACTIVE_424;
+            break;
+      }
       break;
   }
   return PTT_UNDEFINED;
@@ -3333,7 +3381,7 @@ pn53x_get_information_about(nfc_device *pnd, char **pbuf)
   }
   buflen -= res;
 
-  if ((res = snprintf(buf, buflen, "initator mode modulations: ")) < 0) {
+  if ((res = snprintf(buf, buflen, "initiator mode modulations: ")) < 0) {
     free(*pbuf);
     return NFC_ESOFT;
   }

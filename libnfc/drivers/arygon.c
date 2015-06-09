@@ -96,7 +96,10 @@ static const uint8_t arygon_error_unknown_mode[] = "FF060000\x0d\x0a";
 
 // Prototypes
 int     arygon_reset_tama(nfc_device *pnd);
-void    arygon_firmware(nfc_device *pnd, char *str);
+int     arygon_firmware(nfc_device *pnd, char *str);
+int     arygon_switch_led(nfc_device *pnd, char led, char onoff);
+int     arygon_set_uart_speed(nfc_device *pnd, char direction, uint32_t speed);
+int     arygon_serial_no(nfc_device *pnd, char *str);
 
 static size_t
 arygon_scan(const nfc_context *context, nfc_connstring connstrings[], const size_t connstrings_len)
@@ -316,14 +319,57 @@ arygon_open(const nfc_context *context, const nfc_connstring connstring)
   DRIVER_DATA(pnd)->abort_flag = false;
 #endif
 
+  // Test, that we can communicate with current speed:
+  char arygon_firmware_version[10];
+  if (arygon_firmware(pnd, arygon_firmware_version) < 0) {
+    // Speed is not correct.
+    if (ndd.speed == ARYGON_DEFAULT_SPEED) {
+      log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_ERROR, "Can't communicate with default serial port speed: %d bauds", ndd.speed);
+      return NULL;
+    }
+    // Let's try with the default speed:
+    uart_close(sp);
+    log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "Attempt to open: %s at %d bauds.", ndd.port, ARYGON_DEFAULT_SPEED);
+    sp = uart_open(ndd.port);
+    uart_flush_input(sp, true);
+    uart_set_speed(sp, ARYGON_DEFAULT_SPEED);
+    DRIVER_DATA(pnd) ->port = sp;
+
+    if (arygon_firmware(pnd, arygon_firmware_version) < 0) {
+      log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "Can't communicate with default serial port speed: %d bauds", ARYGON_DEFAULT_SPEED);
+      arygon_close(pnd);
+      return NULL ;
+    }
+
+    log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "Sending SET UART BAUD RATE TO HOST %d bauds.", ndd.speed);
+    // We need to change the ARYGON reader speed to specified value:
+    if (arygon_set_uart_speed(pnd, 'h', ndd.speed) < 0) {
+      log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "Can't set ARYGON UART HOST speed to %d bauds", ndd.speed);
+      arygon_close(pnd);
+      return NULL ;
+    }
+    uart_close(sp);
+    // sleep is needed?
+    sleep(1);
+    log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "Attempt to open: %s at %d bauds.", ndd.port, ndd.speed);
+    sp = uart_open(ndd.port);
+    uart_flush_input(sp, true);
+    uart_set_speed(sp, ndd.speed);
+    DRIVER_DATA(pnd) ->port = sp;
+    // Check communication
+    if (arygon_firmware(pnd, arygon_firmware_version) < 0) {
+      log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "Can't communicate with ARYGON after changing UART speed to %d bauds", ndd.speed);
+      arygon_close(pnd);
+      return NULL;
+    }
+  }
+
   // Check communication using "Reset TAMA" command
   if (arygon_reset_tama(pnd) < 0) {
     arygon_close_step2(pnd);
     return NULL;
   }
 
-  char arygon_firmware_version[10];
-  arygon_firmware(pnd, arygon_firmware_version);
   char   *pcName;
   pcName = strdup(pnd->name);
   snprintf(pnd->name, sizeof(pnd->name), "%s %s", pcName, arygon_firmware_version);
@@ -514,7 +560,7 @@ arygon_tama_receive(nfc_device *pnd, uint8_t *pbtData, const size_t szDataLen, i
   return len;
 }
 
-void
+int
 arygon_firmware(nfc_device *pnd, char *str)
 {
   const uint8_t arygon_firmware_version_cmd[] = { DEV_ARYGON_PROTOCOL_ARYGON_ASCII, 'a', 'v' };
@@ -525,12 +571,14 @@ arygon_firmware(nfc_device *pnd, char *str)
   int res = uart_send(DRIVER_DATA(pnd)->port, arygon_firmware_version_cmd, sizeof(arygon_firmware_version_cmd), 0);
   if (res != 0) {
     log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "%s", "Unable to send ARYGON firmware command.");
-    return;
+    pnd->last_error = res;
+    return pnd->last_error;
   }
   res = uart_receive(DRIVER_DATA(pnd)->port, abtRx, szRx, 0, 0);
   if (res != 0) {
     log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "%s", "Unable to retrieve ARYGON firmware version.");
-    return;
+    pnd->last_error = res;
+    return pnd->last_error;
   }
 
   if (0 == memcmp(abtRx, arygon_error_none, 6)) {
@@ -541,7 +589,11 @@ arygon_firmware(nfc_device *pnd, char *str)
       szData = 9;
     memcpy(str, p, szData);
     *(str + szData) = '\0';
+  } else {
+    pnd->last_error = NFC_EIO;
+    return pnd->last_error;
   }
+  return NFC_SUCCESS;
 }
 
 int
@@ -587,6 +639,204 @@ arygon_abort_command(nfc_device *pnd)
   return NFC_SUCCESS;
 }
 
+// led = '2' - red
+// led = '6' - green
+// onoff = '0' - off
+// onoff = '1' - on
+int
+arygon_switch_led(nfc_device *pnd, char led, char onoff)
+{
+  int res;
+  int timeout = 1000;
+  uint8_t abtRxBuf[10];
+  uint8_t arygon_led_onoff_cmd[8] = { DEV_ARYGON_PROTOCOL_ARYGON_ASCII, 'a', 'p', 'c', '0', '2', '0', '0' };
+
+  arygon_led_onoff_cmd[3] = 'c';	// 'c' - for setting the port to output, 'w' - for changing value
+  arygon_led_onoff_cmd[5] = led;	// '6' - green, '2' - red
+  arygon_led_onoff_cmd[7] = '0';	// '0' - in case of 'c', '0' for off, '1' for on
+  res = uart_send(DRIVER_DATA(pnd) ->port, arygon_led_onoff_cmd, sizeof(arygon_led_onoff_cmd), 0);
+  if (res != 0) {
+    log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "%s", "Unable to send ARYGON LED port output command.");
+    pnd->last_error = res;
+    return pnd->last_error;
+  }
+
+  if ((res = uart_receive(DRIVER_DATA(pnd) ->port, abtRxBuf, sizeof(abtRxBuf), 0, timeout)) != 0) {
+    log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_ERROR, "%s", "Unable to read ACK");
+    pnd->last_error = res;
+    return pnd->last_error;
+  }
+
+  arygon_led_onoff_cmd[3] = 'w';
+  arygon_led_onoff_cmd[7] = onoff;
+  res = uart_send(DRIVER_DATA(pnd) ->port, arygon_led_onoff_cmd, sizeof(arygon_led_onoff_cmd), 0);
+  if (res != 0) {
+    log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "%s", "Unable to send ARYGON LED switching command.");
+    pnd->last_error = res;
+    return pnd->last_error;
+  }
+
+  if ((res = uart_receive(DRIVER_DATA(pnd) ->port, abtRxBuf, sizeof(abtRxBuf), 0, timeout)) != 0) {
+    log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_ERROR, "%s", "Unable to read ACK");
+    pnd->last_error = res;
+    return pnd->last_error;
+  }
+
+  if (0 != memcmp(abtRxBuf, arygon_error_none, sizeof(arygon_error_none) - 1)) {
+    pnd->last_error = NFC_EIO;
+    return pnd->last_error;
+  }
+
+  return NFC_SUCCESS;
+}
+
+// direction = 'h' - UART <-> host
+// direction = 't' - UART <-> TAMA
+int
+arygon_set_uart_speed(nfc_device *pnd, char direction, uint32_t speed)
+{
+  uint8_t arygon_cmd[5] = { DEV_ARYGON_PROTOCOL_ARYGON_ASCII, 'a', 'h', '0', '0' };
+  arygon_cmd[2] = direction;	// 'h' - HOST, 't' - TAMA
+  switch (speed) {
+    case 9600:   arygon_cmd[4] = '0'; break;
+    case 19200:  arygon_cmd[4] = '1'; break;
+    case 38400:  arygon_cmd[4] = '2'; break;
+    case 57600:  arygon_cmd[4] = '3'; break;
+    case 115200: arygon_cmd[4] = '4'; break;
+    case 230400: arygon_cmd[4] = '5'; break;
+    case 460800: arygon_cmd[4] = '6'; break;
+    default:
+      // Unsupported speed!
+      log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_ERROR, "Unable to set ARYGON speed to %d bauds. Speed value must be one of these constants: 9600 (default), 19200, 38400, 57600, 115200, 230400 or 460800.", speed);
+      pnd->last_error = NFC_EINVARG;
+      return pnd->last_error;
+      break;
+  }
+
+  int res;
+  int timeout = 1000;
+  uint8_t abtRxBuf[10];
+
+  res = uart_send(DRIVER_DATA(pnd) ->port, arygon_cmd, sizeof(arygon_cmd), 0);
+  if (res != 0) {
+    log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "%s", "Unable to send ARYGON SET UART BAUD RATE TO HOST SIDE command.");
+    pnd->last_error = res;
+    return pnd->last_error;
+  }
+
+  if ((res = uart_receive(DRIVER_DATA(pnd) ->port, abtRxBuf, sizeof(abtRxBuf), 0, timeout)) != 0) {
+    log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_ERROR, "%s", "Unable to read ACK");
+    pnd->last_error = res;
+    return pnd->last_error;
+  }
+
+  if (0 != memcmp(abtRxBuf, arygon_error_none, sizeof(arygon_error_none) - 1)) {
+    pnd->last_error = NFC_EIO;
+    return pnd->last_error;
+  }
+
+  return NFC_SUCCESS;
+}
+
+int
+arygon_serial_no(nfc_device *pnd, char *str)
+{
+  uint8_t arygon_cmd[4] = { DEV_ARYGON_PROTOCOL_ARYGON_ASCII, 'a', 's', 'n' };
+  int res;
+  int timeout = 1000;
+  uint8_t abtRx[18];
+
+  res = uart_send(DRIVER_DATA(pnd) ->port, arygon_cmd, sizeof(arygon_cmd), 0);
+  if (res != 0) {
+    log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "%s", "Unable to send ARYGON GET SERIAL NO command.");
+    pnd->last_error = res;
+    return pnd->last_error;
+  }
+
+  if ((res = uart_receive(DRIVER_DATA(pnd) ->port, abtRx, sizeof(abtRx), 0, timeout)) != 0) {
+    log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_ERROR, "%s", "Unable to read ACK");
+    pnd->last_error = res;
+    return pnd->last_error;
+  }
+
+  if (0 == memcmp(abtRx, arygon_error_none, 6)) {
+    uint8_t *p = abtRx + 6;
+    unsigned int szData;
+    sscanf((const char *)p, "%02x%s", &szData, p);
+    memcpy(str, p, szData);
+    *(str + szData) = '\0';
+  } else {
+    pnd->last_error = NFC_EIO;
+    return pnd->last_error;
+  }
+
+  return NFC_SUCCESS;
+}
+
+static int
+arygon_set_property_int(struct nfc_device *pnd, const nfc_property property, const int value)
+{
+  switch (property) {
+    case NP_UART_SPEED_HOST:
+      return arygon_set_uart_speed(pnd, 'h', value);
+      break;
+    case NP_UART_SPEED_TAMA:
+      return arygon_set_uart_speed(pnd, 't', value);
+      break;
+    default:
+      return pn53x_set_property_int(pnd, property, value);
+  }
+  return NFC_EINVARG;
+}
+
+static int
+arygon_set_property_bool(struct nfc_device *pnd, const nfc_property property, const bool bEnable)
+{
+  switch (property) {
+    case NP_SWITCH_LED_GREEN:
+      return arygon_switch_led(pnd, '6', (bEnable ? '1' : '0'));
+      break;
+    case NP_SWITCH_LED_RED:
+      return arygon_switch_led(pnd, '2', (bEnable ? '1' : '0'));
+      break;
+    default:
+      return pn53x_set_property_bool(pnd, property, bEnable);
+  }
+  return NFC_EINVARG;
+}
+
+static const char arygonInfoStr[] = "arygon uC firmware version: %s\narygon uC unique serial number: %s\n";
+static int
+arygon_get_information_about(nfc_device *pnd, char **pbuf)
+{
+  int res;
+  char firmwareVerBuf[64];
+  char serialNoBuf[64];
+  char *newBuf;
+  size_t startPos;
+  size_t newSize;
+
+  res = pn53x_get_information_about(pnd, pbuf);
+  if (res < 0) return res;
+
+  res = arygon_firmware(pnd, firmwareVerBuf);
+  if (res < 0) return res;
+
+  res = arygon_serial_no(pnd, serialNoBuf);
+  if (res < 0) return res;
+
+  startPos = strlen(*pbuf);
+  newSize = startPos + strlen(firmwareVerBuf) + strlen(serialNoBuf) + strlen(arygonInfoStr) + 1;
+  newBuf = realloc(*pbuf, newSize);
+  if (!newBuf) {
+	free(*pbuf);
+    return NFC_ESOFT;
+  }
+  *pbuf = newBuf;
+  snprintf( &newBuf[startPos], newSize-startPos, arygonInfoStr, firmwareVerBuf, serialNoBuf);
+  return NFC_SUCCESS;
+}
+
 
 const struct pn53x_io arygon_tama_io = {
   .send       = arygon_tama_send,
@@ -619,11 +869,11 @@ const struct nfc_driver arygon_driver = {
   .target_send_bits      = pn53x_target_send_bits,
   .target_receive_bits   = pn53x_target_receive_bits,
 
-  .device_set_property_bool     = pn53x_set_property_bool,
-  .device_set_property_int      = pn53x_set_property_int,
+  .device_set_property_bool     = arygon_set_property_bool,
+  .device_set_property_int      = arygon_set_property_int,
   .get_supported_modulation     = pn53x_get_supported_modulation,
   .get_supported_baud_rate      = pn53x_get_supported_baud_rate,
-  .device_get_information_about = pn53x_get_information_about,
+  .device_get_information_about = arygon_get_information_about,
 
   .abort_command  = arygon_abort_command,
   .idle           = pn53x_idle,
