@@ -281,11 +281,11 @@ arygon_open(const nfc_context *context, const nfc_connstring connstring)
     return NULL;
   }
   snprintf(pnd->name, sizeof(pnd->name), "%s:%s", ARYGON_DRIVER_NAME, ndd.port);
-  free(ndd.port);
 
   pnd->driver_data = malloc(sizeof(struct arygon_data));
   if (!pnd->driver_data) {
     perror("malloc");
+    free(ndd.port);
     uart_close(sp);
     nfc_device_free(pnd);
     return NULL;
@@ -295,6 +295,7 @@ arygon_open(const nfc_context *context, const nfc_connstring connstring)
   // Alloc and init chip's data
   if (pn53x_data_new(pnd, &arygon_tama_io) == NULL) {
     perror("malloc");
+    free(ndd.port);
     uart_close(DRIVER_DATA(pnd)->port);
     nfc_device_free(pnd);
     return NULL;
@@ -310,6 +311,7 @@ arygon_open(const nfc_context *context, const nfc_connstring connstring)
 #ifndef WIN32
   // pipe-based abort mecanism
   if (pipe(DRIVER_DATA(pnd)->iAbortFds) < 0) {
+    free(ndd.port);
     uart_close(DRIVER_DATA(pnd)->port);
     pn53x_data_free(pnd);
     nfc_device_free(pnd);
@@ -325,6 +327,7 @@ arygon_open(const nfc_context *context, const nfc_connstring connstring)
     // Speed is not correct.
     if (ndd.speed == ARYGON_DEFAULT_SPEED) {
       log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_ERROR, "Can't communicate with default serial port speed: %d bauds", ndd.speed);
+      free(ndd.port);
       return NULL;
     }
     // Let's try with the default speed:
@@ -337,6 +340,7 @@ arygon_open(const nfc_context *context, const nfc_connstring connstring)
 
     if (arygon_firmware(pnd, arygon_firmware_version) < 0) {
       log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "Can't communicate with default serial port speed: %d bauds", ARYGON_DEFAULT_SPEED);
+      free(ndd.port);
       arygon_close(pnd);
       return NULL ;
     }
@@ -345,6 +349,7 @@ arygon_open(const nfc_context *context, const nfc_connstring connstring)
     // We need to change the ARYGON reader speed to specified value:
     if (arygon_set_uart_speed(pnd, 'h', ndd.speed) < 0) {
       log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "Can't set ARYGON UART HOST speed to %d bauds", ndd.speed);
+      free(ndd.port);
       arygon_close(pnd);
       return NULL ;
     }
@@ -359,10 +364,12 @@ arygon_open(const nfc_context *context, const nfc_connstring connstring)
     // Check communication
     if (arygon_firmware(pnd, arygon_firmware_version) < 0) {
       log_put(LOG_GROUP, LOG_CATEGORY, NFC_LOG_PRIORITY_DEBUG, "Can't communicate with ARYGON after changing UART speed to %d bauds", ndd.speed);
+      free(ndd.port);
       arygon_close(pnd);
       return NULL;
     }
   }
+  free(ndd.port);
 
   // Check communication using "Reset TAMA" command
   if (arygon_reset_tama(pnd) < 0) {
